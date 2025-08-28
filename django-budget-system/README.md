@@ -1,395 +1,309 @@
-# Django + Celery Budget Management System - Pseudo Code Design
+# Django + Celery Budget Management System
+
+A comprehensive backend system for managing advertising budgets with automatic campaign control based on spend limits and dayparting schedules.
+
+## Features
+
+- **Multi-Brand Support**: Manage multiple brands with individual daily/monthly budgets
+- **Campaign Management**: Automatic campaign activation/deactivation based on budget and time constraints
+- **Dayparting Control**: Time-based campaign scheduling with timezone support
+- **Real-time Budget Tracking**: Immediate spend recording and budget enforcement
+- **Automated Resets**: Daily and monthly budget resets with campaign reactivation
+- **Admin Interface**: Full Django admin for system management
+- **RESTful API**: Endpoints for spend recording and campaign status monitoring
+
+## Tech Stack
+
+- **Django 5.1.2**: Web framework and ORM
+- **Celery 5.5.3**: Background task processing
+- **Redis**: Message broker and result backend
+- **SQLite**: Database (easily switchable to PostgreSQL)
+- **Python Type Hints**: Full static typing with mypy
+
+## Project Structure
+
+```
+budget_management/
+├── budget_management/          # Django project settings
+│   ├── __init__.py
+│   ├── celery.py              # Celery configuration
+│   ├── settings.py            # Django settings
+│   └── urls.py                # Main URL configuration
+├── budget_system/             # Main application
+│   ├── models.py              # Data models
+│   ├── admin.py               # Admin interface
+│   ├── views.py               # API views
+│   ├── urls.py                # App URL configuration
+│   ├── tasks.py               # Celery tasks
+│   └── migrations/            # Database migrations
+├── requirements.txt           # Python dependencies
+├── mypy.ini                  # Type checking configuration
+└── README.md                 # This file
+```
+
+## Installation & Setup
+
+### Prerequisites
+
+- Python 3.8+
+- Redis server
+- pip or pipenv
+
+### 1. Clone Repository
+
+```bash
+git clone <repository-url>
+cd budget_management
+```
+
+### 2. Install Dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### 3. Start Redis
+
+**Windows:**
+```bash
+redis-server
+```
+
+**macOS (with Homebrew):**
+```bash
+brew services start redis
+```
+
+**Linux:**
+```bash
+sudo systemctl start redis-server
+```
+
+### 4. Database Setup
+
+```bash
+# Create and apply migrations
+python manage.py makemigrations
+python manage.py migrate
+
+# Create admin user (optional)
+python manage.py createsuperuser
+```
+
+### 5. Start Services
+
+**Terminal 1 - Django Development Server:**
+```bash
+python manage.py runserver
+```
+
+**Terminal 2 - Celery Worker:**
+```bash
+celery -A budget_management worker --loglevel=info
+```
+
+**Terminal 3 - Celery Beat (Scheduler):**
+```bash
+celery -A budget_management beat --loglevel=info
+```
 
 ## Data Models
 
-### Brand Model
-```
-Brand:
-    - id: Primary Key
-    - name: String (e.g., "Nike", "Coca-Cola")
-    - daily_budget: Decimal (e.g., 1000.00)
-    - monthly_budget: Decimal (e.g., 25000.00)
-    - timezone: String (e.g., "America/New_York")
-    - is_active: Boolean
-    - created_at: DateTime
-    - updated_at: DateTime
+### Brand
+Represents an advertising brand with budget limits and timezone settings.
+- `name`: Brand identifier
+- `daily_budget`: Maximum daily spend
+- `monthly_budget`: Maximum monthly spend  
+- `timezone`: Operating timezone for dayparting
+- `is_active`: Enable/disable brand
+
+### Campaign
+Individual advertising campaigns belonging to brands.
+- `brand`: Foreign key to Brand
+- `name`: Campaign identifier
+- `status`: Current state (ACTIVE, PAUSED_BUDGET, PAUSED_DAYPART, INACTIVE)
+- `is_active`: Manual on/off switch
+
+### DaypartingSchedule
+Defines when campaigns can run during the week.
+- `campaign`: Foreign key to Campaign
+- `day_of_week`: Day (0=Monday, 6=Sunday)
+- `start_hour` / `end_hour`: Time window (0-23)
+- `is_active`: Enable/disable schedule
+
+### SpendRecord
+Immutable audit trail of all advertising spend.
+- `brand` / `campaign`: Foreign keys
+- `amount`: Spend amount
+- `spend_date` / `spend_datetime`: When spend occurred
+
+### BudgetSummary
+Aggregated daily/monthly spend for performance optimization.
+- `brand`: Foreign key
+- `date`: Summary date
+- `daily_spend` / `monthly_spend`: Accumulated amounts
+- `daily_remaining` / `monthly_remaining`: Calculated remaining budgets
+
+## API Endpoints
+
+### Record Spend
+```http
+POST /api/spend/
+Content-Type: application/json
+
+{
+  "brand_id": 1,
+  "campaign_id": 1,
+  "amount": 25.50,
+  "spend_datetime": "2024-01-15T10:30:00Z"  // Optional
+}
 ```
 
-### Campaign Model
-```
-Campaign:
-    - id: Primary Key
-    - brand: Foreign Key to Brand
-    - name: String (e.g., "Nike Summer Sale")
-    - status: Choice Field ["ACTIVE", "PAUSED_BUDGET", "PAUSED_DAYPART", "INACTIVE"]
-    - is_active: Boolean (manual on/off switch)
-    - created_at: DateTime
-    - updated_at: DateTime
+### Get Campaign Status
+```http
+GET /api/campaigns/1/status/
 ```
 
-### DaypartingSchedule Model
-```
-DaypartingSchedule:
-    - id: Primary Key
-    - campaign: Foreign Key to Campaign
-    - day_of_week: Integer (0=Monday, 6=Sunday)
-    - start_hour: Integer (0-23, e.g., 8 for 8 AM)
-    - end_hour: Integer (0-23, e.g., 22 for 10 PM)
-    - is_active: Boolean
-```
-
-### SpendRecord Model
-```
-SpendRecord:
-    - id: Primary Key
-    - brand: Foreign Key to Brand
-    - campaign: Foreign Key to Campaign
-    - amount: Decimal
-    - spend_date: Date
-    - spend_datetime: DateTime
-    - record_type: Choice Field ["DAILY", "MONTHLY"]
-    - created_at: DateTime
-```
-
-### BudgetSummary Model (Aggregated Data)
-```
-BudgetSummary:
-    - id: Primary Key
-    - brand: Foreign Key to Brand
-    - date: Date
-    - daily_spend: Decimal (sum of today's spending)
-    - monthly_spend: Decimal (sum of this month's spending)
-    - daily_remaining: Decimal (daily_budget - daily_spend)
-    - monthly_remaining: Decimal (monthly_budget - monthly_spend)
-    - updated_at: DateTime
-```
-
-## Core Business Logic
-
-### 1. Spend Tracking Logic
-```
-FUNCTION record_spend(campaign_id, amount, timestamp):
-    campaign = get_campaign(campaign_id)
-    brand = campaign.brand
-    spend_date = extract_date(timestamp)
-    
-    // Create spend record
-    spend_record = CREATE SpendRecord(
-        brand=brand,
-        campaign=campaign,
-        amount=amount,
-        spend_date=spend_date,
-        spend_datetime=timestamp,
-        record_type="DAILY"
-    )
-    
-    // Update or create daily summary
-    daily_summary = get_or_create_budget_summary(brand, spend_date)
-    daily_summary.daily_spend += amount
-    daily_summary.daily_remaining = brand.daily_budget - daily_summary.daily_spend
-    
-    // Update monthly summary
-    monthly_summary = get_or_create_monthly_summary(brand, spend_date)
-    monthly_summary.monthly_spend += amount
-    monthly_summary.monthly_remaining = brand.monthly_budget - monthly_summary.monthly_spend
-    
-    // Check budget limits
-    IF daily_summary.daily_remaining <= 0 OR monthly_summary.monthly_remaining <= 0:
-        pause_brand_campaigns_for_budget(brand)
-    
-    SAVE all records
-END FUNCTION
-```
-
-### 2. Budget Enforcement Logic
-```
-FUNCTION pause_brand_campaigns_for_budget(brand):
-    campaigns = get_active_campaigns(brand)
-    
-    FOR EACH campaign IN campaigns:
-        IF campaign.status == "ACTIVE":
-            campaign.status = "PAUSED_BUDGET"
-            SAVE campaign
-            LOG "Campaign {campaign.name} paused due to budget exceeded"
-END FUNCTION
-
-FUNCTION reactivate_campaigns_for_budget(brand):
-    paused_campaigns = get_campaigns_by_status(brand, "PAUSED_BUDGET")
-    
-    FOR EACH campaign IN paused_campaigns:
-        IF brand_has_budget_remaining(brand) AND is_within_dayparting_window(campaign):
-            campaign.status = "ACTIVE"
-            SAVE campaign
-            LOG "Campaign {campaign.name} reactivated - budget available"
-END FUNCTION
-```
-
-### 3. Dayparting Logic
-```
-FUNCTION check_dayparting_for_campaign(campaign, current_time):
-    brand_timezone = campaign.brand.timezone
-    local_time = convert_to_timezone(current_time, brand_timezone)
-    current_day = get_day_of_week(local_time)  // 0=Monday, 6=Sunday
-    current_hour = get_hour(local_time)        // 0-23
-    
-    schedules = get_dayparting_schedules(campaign, current_day)
-    
-    IF schedules is empty:
-        RETURN False  // No schedule = not allowed to run
-    
-    FOR EACH schedule IN schedules:
-        IF schedule.start_hour <= current_hour <= schedule.end_hour:
-            RETURN True
-    
-    RETURN False
-END FUNCTION
-
-FUNCTION enforce_dayparting_for_campaign(campaign):
-    current_time = get_current_time()
-    is_allowed = check_dayparting_for_campaign(campaign, current_time)
-    
-    IF is_allowed AND campaign.status == "PAUSED_DAYPART":
-        // Check if budget is also available
-        IF brand_has_budget_remaining(campaign.brand):
-            campaign.status = "ACTIVE"
-            LOG "Campaign {campaign.name} activated - within dayparting window"
-    
-    ELIF NOT is_allowed AND campaign.status == "ACTIVE":
-        campaign.status = "PAUSED_DAYPART"
-        LOG "Campaign {campaign.name} paused - outside dayparting window"
-    
-    SAVE campaign
-END FUNCTION
-```
-
-### 4. Budget Reset Logic
-```
-FUNCTION reset_daily_budgets():
-    today = get_current_date()
-    all_brands = get_all_active_brands()
-    
-    FOR EACH brand IN all_brands:
-        // Reset daily spend to 0
-        summary = get_or_create_budget_summary(brand, today)
-        summary.daily_spend = 0
-        summary.daily_remaining = brand.daily_budget
-        SAVE summary
-        
-        // Reactivate campaigns paused due to daily budget
-        reactivate_campaigns_for_budget(brand)
-        
-        LOG "Daily budget reset for brand {brand.name}"
-END FUNCTION
-
-FUNCTION reset_monthly_budgets():
-    today = get_current_date()
-    first_day_of_month = get_first_day_of_month(today)
-    all_brands = get_all_active_brands()
-    
-    FOR EACH brand IN all_brands:
-        // Reset monthly spend to 0
-        summary = get_or_create_budget_summary(brand, today)
-        summary.monthly_spend = 0
-        summary.monthly_remaining = brand.monthly_budget
-        SAVE summary
-        
-        // Reactivate campaigns paused due to monthly budget
-        reactivate_campaigns_for_budget(brand)
-        
-        LOG "Monthly budget reset for brand {brand.name}"
-END FUNCTION
-```
-
-## Celery Task Definitions
-
-### 1. Daily Reset Task
-```
-CELERY_TASK daily_budget_reset_task():
-    LOG "Starting daily budget reset task"
-    
-    TRY:
-        reset_daily_budgets()
-        LOG "Daily budget reset completed successfully"
-    CATCH Exception as e:
-        LOG_ERROR "Daily budget reset failed: {e}"
-        // Send alert to administrators
-END TASK
-
-// Schedule: Run every day at 12:01 AM in each brand's timezone
-SCHEDULE: cron(minute=1, hour=0)
-```
-
-### 2. Monthly Reset Task
-```
-CELERY_TASK monthly_budget_reset_task():
-    LOG "Starting monthly budget reset task"
-    
-    TRY:
-        reset_monthly_budgets()
-        LOG "Monthly budget reset completed successfully"
-    CATCH Exception as e:
-        LOG_ERROR "Monthly budget reset failed: {e}"
-        // Send alert to administrators
-END TASK
-
-// Schedule: Run on the 1st day of every month at 12:01 AM
-SCHEDULE: cron(minute=1, hour=0, day_of_month=1)
-```
-
-### 3. Dayparting Enforcement Task
-```
-CELERY_TASK dayparting_enforcement_task():
-    LOG "Starting dayparting enforcement check"
-    
-    all_campaigns = get_all_campaigns_with_dayparting()
-    
-    FOR EACH campaign IN all_campaigns:
-        TRY:
-            enforce_dayparting_for_campaign(campaign)
-        CATCH Exception as e:
-            LOG_ERROR "Dayparting enforcement failed for campaign {campaign.id}: {e}"
-    
-    LOG "Dayparting enforcement check completed"
-END TASK
-
-// Schedule: Run every 5 minutes
-SCHEDULE: cron(minute='*/5')
-```
-
-### 4. Budget Monitoring Task
-```
-CELERY_TASK budget_monitoring_task():
-    LOG "Starting budget monitoring check"
-    
-    all_brands = get_all_active_brands()
-    
-    FOR EACH brand IN all_brands:
-        TRY:
-            daily_summary = get_budget_summary(brand, today())
-            
-            // Check if any campaigns should be paused
-            IF daily_summary.daily_remaining <= 0 OR daily_summary.monthly_remaining <= 0:
-                pause_brand_campaigns_for_budget(brand)
-            
-            // Check if any campaigns can be reactivated
-            ELIF daily_summary.daily_remaining > 0 AND daily_summary.monthly_remaining > 0:
-                reactivate_campaigns_for_budget(brand)
-                
-        CATCH Exception as e:
-            LOG_ERROR "Budget monitoring failed for brand {brand.id}: {e}"
-    
-    LOG "Budget monitoring check completed"
-END TASK
-
-// Schedule: Run every 10 minutes
-SCHEDULE: cron(minute='*/10')
-```
-
-## Key Helper Functions
-
-### Utility Functions
-```
-FUNCTION brand_has_budget_remaining(brand):
-    today = get_current_date()
-    summary = get_budget_summary(brand, today)
-    
-    RETURN summary.daily_remaining > 0 AND summary.monthly_remaining > 0
-END FUNCTION
-
-FUNCTION get_campaigns_eligible_for_activation(brand):
-    paused_campaigns = get_campaigns_by_status(brand, ["PAUSED_BUDGET", "PAUSED_DAYPART"])
-    eligible_campaigns = []
-    
-    FOR EACH campaign IN paused_campaigns:
-        IF brand_has_budget_remaining(brand) AND is_within_dayparting_window(campaign):
-            eligible_campaigns.append(campaign)
-    
-    RETURN eligible_campaigns
-END FUNCTION
-
-FUNCTION calculate_spend_velocity(brand, hours=1):
-    // Calculate spend rate per hour for predictive budget management
-    current_time = get_current_time()
-    start_time = current_time - hours
-    
-    recent_spend = sum_spend_records(brand, start_time, current_time)
-    RETURN recent_spend / hours
-END FUNCTION
-```
-
-## API Endpoints (Django Views)
-
-### Spend Recording Endpoint
-```
-API_ENDPOINT record_campaign_spend(request):
-    campaign_id = request.POST.get('campaign_id')
-    amount = request.POST.get('amount')
-    timestamp = request.POST.get('timestamp', current_time())
-    
-    VALIDATE input_data
-    
-    TRY:
-        record_spend(campaign_id, amount, timestamp)
-        RETURN success_response()
-    CATCH Exception as e:
-        RETURN error_response(e)
-END ENDPOINT
-```
-
-### Campaign Status Endpoint
-```
-API_ENDPOINT get_campaign_status(request, campaign_id):
-    campaign = get_campaign(campaign_id)
-    budget_summary = get_budget_summary(campaign.brand, today())
-    
-    response_data = {
-        'campaign_id': campaign.id,
-        'status': campaign.status,
-        'is_within_dayparting': is_within_dayparting_window(campaign),
-        'brand_daily_remaining': budget_summary.daily_remaining,
-        'brand_monthly_remaining': budget_summary.monthly_remaining
+**Response:**
+```json
+{
+  "success": true,
+  "data": {
+    "campaign_id": 1,
+    "campaign_name": "Nike Summer Sale",
+    "brand_name": "Nike",
+    "status": "ACTIVE",
+    "can_run_now": true,
+    "is_within_dayparting": true,
+    "brand_budget_status": {
+      "daily_remaining": 750.00,
+      "monthly_remaining": 15000.00
     }
-    
-    RETURN json_response(response_data)
-END ENDPOINT
+  }
+}
 ```
 
-## System Workflow Summary
+### Toggle Campaign
+```http
+POST /api/campaigns/1/toggle/
+Content-Type: application/json
 
-### Daily Workflow:
-1. **12:01 AM**: Daily budget reset task runs
-   - Reset daily spend to 0 for all brands
-   - Reactivate campaigns paused due to daily budget limits
+{
+  "action": "activate"  // or "deactivate"
+}
+```
 
-2. **Every 5 minutes**: Dayparting enforcement
-   - Check if campaigns should be paused/activated based on time windows
+### Get Brand Status
+```http
+GET /api/brands/1/status/
+```
 
-3. **Every 10 minutes**: Budget monitoring
-   - Check current spend against budgets
-   - Pause campaigns if limits exceeded
-   - Reactivate campaigns if budget becomes available
+## System Workflow
 
-4. **Throughout day**: Spend recording
-   - Real-time spend tracking via API calls
-   - Immediate budget limit enforcement
+### Daily Operations
 
-### Monthly Workflow:
-1. **1st day of month, 12:01 AM**: Monthly budget reset
-   - Reset monthly spend to 0 for all brands
-   - Reactivate campaigns paused due to monthly budget limits
+**12:01 AM (Brand Timezone):**
+- Daily budget reset task runs
+- Daily spend counters reset to $0
+- Campaigns paused for daily budget limits are reactivated
 
-## Error Handling & Logging
+**Every 5 Minutes:**
+- Campaign status monitoring
+- Automatic pause if budget exceeded
+- Reactivation when budget becomes available
 
-### Critical Operations:
-- All budget operations wrapped in database transactions
-- Comprehensive logging for audit trails
-- Alerting system for task failures
-- Retry mechanisms for transient failures
-- Dead letter queues for failed tasks
+**Every Hour:**
+- Dayparting enforcement check
+- Campaign pause/activation based on time windows
 
-### Monitoring Points:
-- Budget utilization rates
-- Campaign activation/deactivation events
-- Task execution success/failure rates
-- API endpoint response times
-- Database query performance
+**Real-time:**
+- Spend recording via API
+- Immediate budget limit checks
+
+### Monthly Operations
+
+**1st Day of Month, 12:01 AM:**
+- Monthly budget reset
+- Monthly spend counters reset to $0
+- Campaigns paused for monthly limits are reactivated
+
+### Background Tasks
+
+1. **`check_campaign_dayparting`**: Enforces time-based campaign scheduling
+2. **`update_campaign_status`**: Monitors and updates campaign states based on budget
+3. **`reset_daily_budgets`**: Resets daily spend counters and reactivates campaigns
+4. **`reset_monthly_budgets`**: Resets monthly spend counters and reactivates campaigns
+5. **`record_spend`**: Processes spend transactions and updates budgets
+
+## Admin Interface
+
+Access the Django admin at `http://localhost:8000/admin/` to:
+- Manage brands and their budgets
+- Create and configure campaigns
+- Set up dayparting schedules
+- View spend records and budget summaries
+- Monitor system health
+
+## Type Checking
+
+Run type checking with mypy:
+```bash
+mypy .
+```
+
+Configuration is in `mypy.ini` with strict settings enabled.
+
+## Development & Testing
+
+### Manual Testing Workflow
+
+1. Create a brand via admin interface
+2. Add campaigns with dayparting schedules
+3. Record spend via API endpoints
+4. Observe automatic campaign pausing when budgets exceeded
+5. Verify daily/monthly resets reactivate campaigns
+
+### Monitoring
+
+- Check Celery worker logs for task execution
+- Monitor Django logs for API request handling
+- Use Redis CLI to inspect task queues: `redis-cli monitor`
+
+## Assumptions & Simplifications
+
+1. **Timezone Handling**: All brands operate in their specified timezone for dayparting, but spend recording uses UTC
+2. **Budget Enforcement**: Campaigns are paused immediately when budgets are exceeded (no grace period)
+3. **Dayparting Logic**: Campaigns require explicit schedule entries to run (no schedule = no running)
+4. **Monthly Calculations**: Monthly budgets reset on the 1st day regardless of when the brand was created
+5. **Spend Validation**: Assumes spend amounts are always positive and valid
+6. **Concurrency**: Uses Celery's built-in task queuing for spend recording to handle concurrent requests
+
+## Architecture Decisions
+
+- **BudgetSummary Model**: Denormalized data for performance - avoids expensive aggregation queries
+- **Separate SpendRecord**: Maintains immutable audit trail while allowing summary optimizations  
+- **Status-based Campaign Control**: Explicit status field makes debugging and monitoring easier
+- **Timezone per Brand**: Allows global brands to operate in their local time zones
+- **Celery for All Background Work**: Consistent async processing for all time-based operations
+
+## Production Considerations
+
+For production deployment:
+1. Switch to PostgreSQL database
+2. Use Redis cluster for high availability
+3. Add proper logging and monitoring
+4. Implement API authentication
+5. Add rate limiting and input validation
+6. Set up proper error alerting
+7. Consider database connection pooling
+8. Add health check endpoints
+
+## Environment Setup
+
+1. Copy the environment template:
+   ```bash
+   cp .env.example .env
+
+## License
+
+This project is for demonstration purposes as part of a coding challenge.
